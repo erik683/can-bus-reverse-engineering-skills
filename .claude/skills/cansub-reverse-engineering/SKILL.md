@@ -6,7 +6,7 @@ description: >
   coolant temp, throttle, door lock, ...) and derive its start-bit, length,
   endianness, scale and offset into a DBC. A deterministic chain of Python scripts
   (survey -> correlate -> bitsearch -> build_dbc -> verify) replaces "a human
-  watches the screen to spot correlations". Works three ways: (1) OFFLINE - decode a
+  watches the screen to spot correlations". Works four ways: (1) OFFLINE - decode a
   signal from an EXISTING recorded log the user already has (a CAN + OBD2 log, an
   MF4/CANedge log, or a webCAN CSV) using a separately decodable reference such as
   an OBD2 PID (engine RPM, vehicle speed, coolant temp) or a CSS Electronics GPS
@@ -15,12 +15,18 @@ description: >
   (2) LIVE - capture from a CSS Electronics CANsub interface with a human-supplied
   reference; or (3) VISION - the user has a CAN log plus a VIDEO of a display
   (dashboard / gauge app / instrument) showing the true value, and a local
-  open-source OCR script digitizes the on-screen number into the reference. Trigger
+  open-source OCR script digitizes the on-screen number into the reference; or
+  (4) PARALLEL DECODED-LOG - the user has the raw CAN log PLUS a separate decoded
+  scan-tool log (HP Tuners / "HPT", FORScan, Torque, a dyno) that already lists the
+  signal in physical units; it is time-aligned to the raw bus (solve a global offset)
+  and used as the reference - NO hardware needed. Trigger
   this skill whenever the user wants to reverse engineer, decode, identify or "find
   the CAN ID/bits for" an unknown signal, or build a DBC from a log - INCLUDING
   phrasings like "reverse engineer Vehicle Speed from my CAN/OBD2 log file
-  <name>.csv", "which CAN message carries RPM in this log", or "decode <signal> from
-  my CAN log using this dashboard video as the reference".
+  <name>.csv", "which CAN message carries RPM in this log", "decode <signal> from
+  my CAN log using this dashboard video as the reference", or "find RPM/speed in my
+  CAN log using my HP Tuners / HPT scan-tool log". Raw logs may arrive as
+  GVRET / SavvyCAN CSV exports (Time Stamp,ID,...,D1..D8) - convert to webCAN first.
   Targets plain, non-multiplexed CAN signals. Ad-hoc input logs the user refers to
   by filename usually sit in the working-directory root (or under TEMP/) — glob for
   the named file there before asking where it is.
@@ -49,12 +55,15 @@ clock to host time on connect, so trace and sidecar share a reference).
   *target* (deferred). A *multiplexed reference DBC* (e.g. OBD2) is fine — see the
   **Offline workflow** — because cantools decodes the reference; the raw target is
   still treated as a plain field.
-- Three reference sources: a **live** human reference via the CANsub + Flask app (the
-  Workflow below); when the user already has a recorded log with a decodable
-  reference, **decode the reference from the log** (Offline workflow); or, when the
-  user has a recorded log plus a **video of a display** showing the value,
-  **OCR the reference from the video** (Vision workflow). All three feed the same
-  correlate → bitsearch → build_dbc → verify pipeline.
+- Four reference sources, all feeding the same correlate → bitsearch → build_dbc →
+  verify pipeline: a **live** human reference via the CANsub + Flask app (the
+  Workflow below); when the user already has a recorded log with an **on-bus**
+  decodable reference, **decode the reference from the log** (Offline workflow); when
+  the user has a **second, parallel log from a scan tool** (HP Tuners, FORScan, a
+  dyno) that already lists the signal in physical units, **time-align that decoded log
+  as the reference** (Parallel decoded-log workflow); or, when the user has a recorded
+  log plus a **video of a display** showing the value, **OCR the reference from the
+  video** (Vision workflow).
 - Handles **classical CAN and CAN FD** payloads (up to 64 bytes); fields are
   extracted with arbitrary-precision integers, so a signal can sit anywhere in an
   FD frame. (The generated DBC decodes FD correctly via the message length; it
@@ -614,6 +623,16 @@ cantools decodes its multiplexed PID messages directly, so `--signal rpm` /
 GPS DBCs below; only ask the user for a DBC for some *other* non-bundled source —
 e.g. a third-party sensor-to-CAN module.)
 
+**Caution — not all `0x7E0`/`0x7E8` traffic is standard OBD2.** A log may carry
+**manufacturer-proprietary enhanced diagnostics** on the same request/response IDs:
+e.g. Ford uses services `0xA0`/`0xA1` (positive responses `0xE0`/`0xE1`), **not** SAE
+J1979 mode-01 PIDs, so the bundled OBD2 DBC will **not** decode them, and such
+handshakes are usually far too sparse to be a reference anyway. If
+`decode_reference.py --dbc OBD-v4.4.dbc` finds nothing decodable on `0x7E8`, inspect
+the response service byte before concluding the log "has no reference" — the real
+reference may instead be a **parallel scan-tool log** (see the Parallel decoded-log
+workflow).
+
 **Bundled GPS/GNSS DBCs — use these for a CSS Electronics GPS reference.** Many
 CANedge recordings include a **GPS/IMU reference on the same SD card** as the
 proprietary vehicle data — either from a **CANedge with internal GPS/IMU** (the
@@ -650,6 +669,19 @@ The log must be **webCAN CSV** (the `python-can-cansub` native format, same head
 the live capture writes). A **CANedge** user can produce it from an MF4 log with
 the **mdf2csv** converter (see the `process-log-files` skill) and then use this
 workflow unchanged.
+
+**Non-webCAN raw exports must be converted first (don't feed them to the scripts).**
+Other loggers export different CSV layouts — most commonly a **GVRET / SavvyCAN**
+export, header `Time Stamp,ID,Extended,Dir,Bus,LEN,D1..D8`, **comma**-separated,
+timestamp in **microseconds**, one hex byte per `Dn` column (e.g.
+`4481122,00000215,false,Rx,0,8,27,60,...`). The scripts only read webCAN
+(`TimestampEpoch;BusChannel;ID;IDE;DLC;DataLength;Dir;EDL;BRS;ESI;RTR;DataBytes`,
+**semicolon**-separated). The conversion is mechanical: µs→s for the epoch column,
+`Rx`→`Dir 0` / `Tx`→`1`, `Extended`(true/false)→`IDE`(1/0), keep `BusChannel`/`DLC`/
+`DataLength`, and **concatenate `D1..D{LEN}` into the one hex `DataBytes` string** with
+no separators; set `EDL/BRS/ESI/RTR=0` for classical CAN. Validate by loading the
+result with `common.load_trace` (it raises on a wrong header); `load_trace` sorts by
+time, so an unsorted source export is fine.
 
 0. **Locate the log (don't ask — glob).** If the user named the file (e.g.
    `chevy-tahoe-obd2-can-data.csv`) or said "my log/CSV", find `<log.csv>` by
@@ -697,6 +729,108 @@ workflow unchanged.
 The decoded sidecar is a normal `kind=value` reference, so the whole downstream
 pipeline is unchanged. `calibrate.py` is rarely needed here — the decoded
 reference is already in physical units.
+
+## Parallel decoded-log workflow — a scan-tool export as the reference
+
+Use this when the user has **two parallel recordings of the same drive**: the raw
+proprietary CAN log, **and a separate decoded log from a scan tool** (HP Tuners /
+"HPT", FORScan, Torque, a dyno) that already lists the target signal in **physical
+units** over time. The scan-tool log is a machine reference — near-zero lag, dense,
+in real units — so it fits as well as the Offline on-bus reference. The **only**
+difference from the Offline workflow is that the reference lives in a **separate file
+on an independent clock**, so you must **time-align** it (solve a global offset Δ)
+before searching. Everything downstream (survey → correlate → bitsearch → build_dbc →
+verify) is identical to the Offline workflow, run **without `--exclude-ids`** (the
+reference is off-bus — there is nothing to self-match).
+
+**Recognising the two inputs.**
+- **Raw CAN log** — rows of ID + data bytes (webCAN, or a GVRET/SavvyCAN export to
+  convert first; see the Offline workflow's format note above).
+- **Scan-tool log (the reference)** — *not* CAN. Typically a wide CSV with signal
+  names, sometimes a second units row, and a leading time column in seconds, milliseconds or microseconds; every other column is an already-decoded physical channel (Engine RPM
+  `rpm`, Vehicle Speed `mph`, Throttle `°`, Coolant `°F`, …). HP Tuners samples fast
+  (~60 Hz) because it **passively decodes the OEM broadcast frames** — the very frames
+  you are reverse-engineering — so its values track the raw bus tightly, off only by
+  the constant clock offset. (Don't expect it to come from the sparse `0x7E0`/`0x7E8`
+  diagnostic polling; that handshake is usually proprietary and too sparse — see the
+  OBD2 caution.)
+
+This workflow has **three bundled scripts** of its own (the rest of the chain is
+shared): `savvycan_to_webcan.py` (raw-format conversion), `scanlog_reference.py`
+(scan-tool column → sidecar), and `align_reference.py` (the Δ solver). Each takes
+`--help`.
+
+**1. Convert each input to the standard formats.** If the raw CAN log is a
+GVRET/SavvyCAN export, convert it to webCAN (skip if it is already webCAN):
+   `python scripts/savvycan_to_webcan.py --input <raw>.csv --out temp-output/trace_<app>.csv`
+   List the scan-tool channels, then extract the **pilot** channel (Engine RPM) as a
+   **baseline** sidecar at `--offset 0`:
+   `python scripts/scanlog_reference.py --log <scan>.csv`  (prints name + unit per column)
+   `python scripts/scanlog_reference.py --log <scan>.csv --signal "Engine RPM" \
+       --label engine_rpm_ref --offset 0 --out temp-output/sidecar_rpm_baseline.csv`
+   (`--signal` is a case-insensitive exact-or-unique-substring match. The script
+   auto-sniffs comma/semicolon/tab delimiters, auto-detects whether there is a units
+   row, and infers seconds vs milliseconds from the time column name/unit; override
+   with `--delimiter`, `--header-rows`, or `--time-scale` if needed. Text columns like
+   `Torque Source` are skipped.)
+
+**2. Solve the global clock offset Δ — ONCE per log pair (the crux).**
+   `python scripts/align_reference.py --trace temp-output/trace_<app>.csv \
+       --ref temp-output/sidecar_rpm_baseline.csv --exclude-ids <diag-ids>`
+   The two logs are on independent clocks, and the per-signal lag search inside
+   correlate/bitsearch/verify is only a **21-point grid over ±`max_lag`** — fine for a
+   sub-second residual, **far too coarse for a multi-second offset**, so a wide
+   `--max-lag` alone won't find it. `align_reference.py` instead cross-correlates the
+   reference against **every** candidate raw field (id × byte-offset × width ×
+   endianness) over a wide lag range (`--max-lag`, default ±60 s, FFT), so the **true
+   field wins and its peak lag is Δ** (it prints the ranked carriers — an independent
+   confirmation — then refines Δ with a Pearson scan). Use the most dramatic channel as
+   the pilot (**Engine RPM** is ideal — high variance, ~0 sensor lag); a clean lock
+   reads **r ≈ 0.99**. Note the printed **`DELTA`**.
+
+**3. Build every sidecar with that Δ and run the pipeline.** Re-emit each channel on
+the CAN clock with the **shared** offset (only `--signal`/`--label`/`--out` change):
+   `python scripts/scanlog_reference.py --log <scan>.csv --signal "<channel>" \
+       --label <signal>_ref --offset <Δ> --out temp-output/sidecar_<signal>.csv`
+   then **survey → correlate → bitsearch → build_dbc → verify** exactly as in the
+   Offline workflow steps 2–4 (continuous reference, **no `--ref-window`**, **no
+   `--exclude-ids`**, `--max-lag 2`). correlate should now report **lag ≈ 0** — the
+   proof Δ was right. Solve Δ once on RPM and **reuse it for every other channel** in
+   that log pair; the alignment is shared. (Worked example: a 2006 Mustang HS-CAN dump
+   + an HP Tuners log aligned at Δ≈+5.9 s, r≈0.996; Engine RPM decoded to `0x201`,
+   big-endian byte 0–1, scale `0.25` rpm/bit — bitsearch's Intel-only start-bit search
+   under-reads a **big-endian** wide field as just its high active bits, so trust
+   `correlate`'s `--order big` byte/width geometry and let
+   `build_dbc --byte 0 --width 2 --order big` fit the full field.)
+
+**Slow / polled channels need a wider lag — and resist the ramp-fit trap.** A scan tool
+*polls* each channel, and many physical signals are slow (temperatures, pressures), so
+the reference can lag the bus by **several seconds** (sensor + transport + polling),
+versus ~0 s for RPM/speed. If `correlate`/`bitsearch` report a lag **pinned at the
+±`max_lag` boundary**, widen it (`--max-lag 6–8`) until the optimum is interior. And on a
+slow **monotonic ramp** (a cold-start warm-up), the lag-aligned **linear-fit slope is
+still tilted** by the transient mismatch — `build_dbc` reports a few-percent-off,
+non-round scale even when the geometry is correct. Don't trust the ramp regression for
+the scale: confirm the encoding **byte-by-byte at several operating points** (a Ford
+engine temp reads `°C = byte − 40`, exact at both the cold start and the warm plateau)
+and **force it** (`--scale 1 --offset -40`). A verify **slope ≈ 1.0** with only a small
+residual bias then confirms the forced encoding (that residual is the irreducible
+quantization / polling-lag, not an error).
+
+**Honest-failure / sanity — most scan-tool channels are NOT on the bus.** A scan tool
+reads the bulk of its channels straight from **ECU RAM via diagnostics**, not from
+broadcast frames, so only a subset of the columns is actually broadcast and the rest
+**won't decode from the bus no matter how hard you search**. The tell of a non-broadcast
+channel: its best field **anywhere** only reaches a **moderate r² (≈0.5–0.95)** and lands
+on a **byte already assigned to a physically-correlated signal** — i.e. it's a *proxy*
+(throttle/MAF tracking the accelerator pedal; a second engine "temp" tracking the one
+broadcast temp), not its own field. Separate it by **absolute value at a distinctive
+operating point** (see *Notes for the assistant*); when no field reads the channel's
+*own* value there, **report "not broadcast"** rather than forcing a fit. Also confirm the
+two spans roughly match (same drive) and Δ gives r ≈ 0.99 before trusting it, and skip a
+channel that barely moves in the drive (e.g. barometric pressure — no excitation). Bus
+content can differ between captures (an ID present in one drive may be absent in
+another), so re-survey each capture rather than assuming a fixed ID set.
 
 ## Vision workflow — digitize a reference from a video of a display
 
@@ -846,6 +980,25 @@ is unchanged.
   motivated the sweep workflow: the true field was `correlate`'s #1, overridden by an
   "`8×0x80` = 8 gauges" story that was really eight zeroed pulse counters — and it was
   the **baseline-vs-sweep delta**, not the calm scan, that actually disambiguated.
+- **Co-varying signals defeat correlation — disambiguate by ABSOLUTE VALUE, not r².**
+  When several targets move together (everything that rises with engine demand —
+  throttle/pedal/MAF/load/MAP; or all the engine temperatures warming together at
+  once), each correlates ~perfectly with the others' fields, so `correlate`/Spearman
+  rank a *proxy* at the top. The tell: a moderate r² (≈0.5–0.95) landing on a byte
+  already assigned to a physically-related signal. The discriminator is the channel's
+  **own absolute value at a distinctive operating point** — the true field must read
+  *that* value there (the warm-end temperature, 0 at rest, atmospheric at WOT), not a
+  neighbour's. This, not a cleverer excitation, is what separates a collinear cluster.
+- **Cross-capture validation is the strongest confirmation.** A field that re-decodes a
+  *separate* capture of the same vehicle (a different drive) at Spearman ≈ 0.99 is real,
+  not overfit. When you have two recordings, identify/calibrate on one and **verify the
+  finished DBC against the other** — far stronger than any single-run score.
+- **Big-endian (Motorola) fields: trust `correlate`'s byte/width geometry, not
+  `bitsearch`'s slice.** `bitsearch`'s start-bit search is Intel/LSB-first, so a
+  big-endian multi-byte field gets **under-read as a narrow slice of its high byte**
+  (e.g. a 16-bit RPM field reported as a 6-bit field). When `correlate` ranks an
+  `--order big` byte/width candidate at the top with high R², build from THAT
+  (`build_dbc --byte … --width … --order big`), not bitsearch's narrow winner.
 - **Show the analysis plots; use them to widen the search.** survey / correlate /
   bitsearch / build_dbc each auto-emit a polished PNG into the signal's
   `analysis-plots/` (pass `--plots-dir …/analysis-plots/`; `--no-plots` to skip).

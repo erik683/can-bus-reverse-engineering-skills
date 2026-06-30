@@ -26,10 +26,14 @@ from pathlib import Path
 import cantools
 
 
-def _rebuild_message(frame_id, name, is_ext, signals):
-    length = max((s.start + s.length + 7) // 8 for s in signals)
+def _rebuild_message(frame_id, name, is_ext, signals, declared_len=0):
+    # Preserve the true frame DLC the source messages declare (build_dbc sets it to
+    # the actual payload length), not just the highest signal's extent - a frame can
+    # be wider than its decoded signals (e.g. 0x201 stays 8 bytes even when the top
+    # decoded signal ends at byte 6).
+    extent = max((s.start + s.length + 7) // 8 for s in signals)
     return cantools.database.can.Message(
-        frame_id=frame_id, name=name, length=length,
+        frame_id=frame_id, name=name, length=max(declared_len, extent),
         is_extended_frame=is_ext, signals=signals)
 
 
@@ -43,9 +47,18 @@ def merge_databases(paths: list[Path]) -> cantools.database.Database:
                 existing = by_id[m.frame_id]
                 names = {s.name for s in m.signals}
                 kept = [s for s in existing.signals if s.name not in names]
-                by_id[m.frame_id] = _rebuild_message(
-                    m.frame_id, existing.name, existing.is_extended_frame,
-                    kept + list(m.signals))
+                try:
+                    by_id[m.frame_id] = _rebuild_message(
+                        m.frame_id, existing.name, existing.is_extended_frame,
+                        kept + list(m.signals),
+                        declared_len=max(existing.length, m.length))
+                except cantools.database.errors.Error as e:
+                    raise SystemExit(
+                        f"ERROR: cannot combine {p} - {e}\n"
+                        f"  Two signal DBCs claim overlapping bits in frame "
+                        f"0x{m.frame_id:X} (a wrong or duplicate decode - e.g. a\n"
+                        f"  signal that only proxies another). Quarantine one (rename "
+                        f"its .dbc, e.g. .dbc.bad) and re-run.")
             else:
                 by_id[m.frame_id] = m
     return cantools.database.Database(messages=list(by_id.values()))
