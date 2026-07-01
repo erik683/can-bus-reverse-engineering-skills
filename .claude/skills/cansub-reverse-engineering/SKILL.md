@@ -784,9 +784,11 @@ GVRET/SavvyCAN export, convert it to webCAN (skip if it is already webCAN):
        --label engine_rpm_ref --offset 0 --out temp-output/sidecar_rpm_baseline.csv`
    (`--signal` is a case-insensitive exact-or-unique-substring match. The script
    auto-sniffs comma/semicolon/tab delimiters, auto-detects whether there is a units
-   row, and infers seconds vs milliseconds from the time column name/unit; override
-   with `--delimiter`, `--header-rows`, or `--time-scale` if needed. Text columns like
-   `Torque Source` are skipped.)
+   row, skips a scan-tool preamble before the header — e.g. a raw HP Tuners export's
+   `[Log Information]` / channel-ID / `[Channel Data]` block parses as-is, no manual
+   clean-up — and infers seconds vs milliseconds from the time column name/unit;
+   override with `--delimiter`, `--header-rows`, or `--time-scale` if needed. Text
+   columns like `Torque Source` are skipped.)
 
 **2. Solve the global clock offset Δ — ONCE per log pair (the crux).**
    `python scripts/align_reference.py --trace temp-output/trace_<app>.csv \

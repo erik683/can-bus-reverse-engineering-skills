@@ -96,6 +96,25 @@ this combined DBC in [webCAN](https://www.csselectronics.com/pages/webcan-can-bu
 and stream live from your CANsub to see your reverse-engineered signals decoded in
 real time - a final, live confirmation of the results.
 
+## Testing
+
+An end-to-end regression suite runs the whole script chain (convert → align →
+survey → correlate → bitsearch → build_dbc → verify → filter_regime) against
+bundled subsets of two real 2006 Mustang GT drives with known ground truth
+(see `tests/fixtures/mustang/README.md`), asserting the known field
+geometries, scales, verify gates, the torque "not broadcast" negative control,
+and a cross-capture re-decode. Known tool gaps are encoded as expected
+failures (XFAIL) so they double as acceptance tests for planned fixes:
+
+```
+.venv/bin/python tests/regression_mustang.py                 # ~2-3 min, bundled fixtures
+.venv/bin/python tests/regression_mustang.py --full          # full local logs, if present
+```
+
+Run it after changing anything under
+`.claude/skills/cansub-reverse-engineering/scripts/` (it also invokes the
+`common.py` / `bitsearch.py` selftests).
+
 ## License and attribution
 
 These skills are fully open source under the [MIT License](LICENSE) - you are free to use, modify and distribute them in your own projects.

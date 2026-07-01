@@ -62,3 +62,8 @@ decoding-output/
 
 # Ad-hoc input folder for user-supplied logs/CSVs
 TEMP/
+
+# Full-size local vehicle logs (~100 MB). The regression suite ships small
+# subsets in tests/fixtures/mustang/ instead; --full mode reads these when
+# present locally.
+mustang-test-logs/

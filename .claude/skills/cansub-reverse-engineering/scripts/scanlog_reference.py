@@ -59,12 +59,43 @@ def _read_rows(path: str, delimiter: str):
         return list(reader)
 
 
-def _infer_header_rows(rows: list[list[str]]) -> int:
-    if len(rows) < 2:
-        return 1
-    # A units row normally has "s", "rpm", "mph", etc. in the first time column.
-    # If the second row starts with a number, it is already data.
-    return 1 if rows[1] and _float_or_none(rows[1][0].strip()) is not None else 2
+def _infer_layout(rows: list[list[str]]) -> tuple[int, int | None, int]:
+    """Locate (names_row, units_row_or_None, data_start) in a scan-tool CSV.
+
+    Handles a preamble before the header (an HP Tuners export leads with
+    "[Log Information]" / a numeric channel-ID row / "[Channel Data]"): the data
+    start is the first row opening a RUN of consecutive numeric-first rows of
+    consistent width (a lone numeric-looking preamble row - the channel-ID line -
+    is followed by the names row, so it never starts a run). The names/units rows
+    are then the nearest data-width rows above it: one wide row = names only; two
+    = names + units (the lower is units), skipping narrow section markers.
+    """
+    def numeric_first(r):
+        return bool(r) and _float_or_none(r[0].strip()) is not None
+
+    data_start = None
+    for i, row in enumerate(rows):
+        if not numeric_first(row) or len(row) < 2:
+            continue
+        run = min(5, len(rows) - i)
+        if all(numeric_first(rows[j]) and abs(len(rows[j]) - len(row)) <= 1
+               for j in range(i, i + run)):
+            data_start = i
+            break
+    if data_start is None or data_start == 0:
+        # No preamble/header structure found - fall back to the simple layout.
+        if len(rows) >= 2 and rows[1] and not numeric_first(rows[1]):
+            return 0, 1, 2
+        return 0, None, 1
+
+    width = len(rows[data_start])
+    wide = [i for i in range(data_start - 1, -1, -1)
+            if len(rows[i]) >= max(2, width // 2) and not numeric_first(rows[i])]
+    if not wide:
+        return 0, None, data_start
+    if len(wide) >= 2 and wide[1] == wide[0] - 1:
+        return wide[1], wide[0], data_start     # names above units
+    return wide[0], None, data_start
 
 
 def _infer_time_scale(name: str, unit: str) -> float:
@@ -113,14 +144,17 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     rows = _read_rows(args.log, args.delimiter)
-    header_rows = _infer_header_rows(rows) if args.header_rows == 0 else args.header_rows
-    if header_rows < 1:
+    if args.header_rows == 0:
+        names_i, units_i, data_start = _infer_layout(rows)
+    elif args.header_rows >= 1:
+        names_i, units_i, data_start = 0, (1 if args.header_rows >= 2 else None), args.header_rows
+    else:
         sys.exit("--header-rows must be 0 (auto) or >=1")
-    if len(rows) <= header_rows:
+    if len(rows) <= data_start:
         sys.exit("log has no data rows")
-    names = rows[0]
-    units = rows[1] if header_rows >= 2 else [""] * len(names)
-    data = rows[header_rows:]
+    names = rows[names_i]
+    units = rows[units_i] if units_i is not None else [""] * len(names)
+    data = rows[data_start:]
 
     if not args.signal:
         print(f"{len(data)} data rows; columns (name [unit]):")
