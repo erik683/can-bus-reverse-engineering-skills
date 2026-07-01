@@ -48,6 +48,19 @@ after the rate is known. Human timing/value input is logged to a separate
 *sidecar* file and aligned to the trace by epoch timestamp (the CANsub sets its
 clock to host time on connect, so trace and sidecar share a reference).
 
+## Reporting discipline — report the evidence, recommend the call
+
+State the evidence and your recommendation; leave the final call to the reviewer. Two
+habits keep the reports honest:
+
+- **Don't turn a finite search into a flat negative.** "No broadcast field found across
+  what I tested" is fair; "not broadcast" isn't — the search only covered the regimes,
+  drives, widths and encodings you actually tried. Say which those were and what's still
+  untried, so the reviewer knows where to look next rather than assuming the door is shut.
+- **A strong match is a recommendation, not a certainty** — "r=0.997 across two drives,
+  recommend accepting" reads better than "confirmed". `verify.py` uses `UNCONFIRMED` the
+  same way: *not yet confirmed*, not *disproven*.
+
 ## Scope (v1)
 
 - Targets **plain, non-multiplexed CAN signals** (the signal being decoded). No
@@ -755,10 +768,11 @@ reference is off-bus — there is nothing to self-match).
   diagnostic polling; that handshake is usually proprietary and too sparse — see the
   OBD2 caution.)
 
-This workflow has **three bundled scripts** of its own (the rest of the chain is
+This workflow has **four bundled scripts** of its own (the rest of the chain is
 shared): `savvycan_to_webcan.py` (raw-format conversion), `scanlog_reference.py`
-(scan-tool column → sidecar), and `align_reference.py` (the Δ solver). Each takes
-`--help`.
+(scan-tool column → sidecar), `align_reference.py` (the Δ solver), and
+`filter_regime.py` (slice the trace + sidecar to an operating regime — the
+deterministic divergence-regime proxy test). Each takes `--help`.
 
 **1. Convert each input to the standard formats.** If the raw CAN log is a
 GVRET/SavvyCAN export, convert it to webCAN (skip if it is already webCAN):
@@ -817,20 +831,55 @@ and **force it** (`--scale 1 --offset -40`). A verify **slope ≈ 1.0** with onl
 residual bias then confirms the forced encoding (that residual is the irreducible
 quantization / polling-lag, not an error).
 
-**Honest-failure / sanity — most scan-tool channels are NOT on the bus.** A scan tool
+**Honest-failure / sanity — many scan-tool channels are not broadcast.** A scan tool
 reads the bulk of its channels straight from **ECU RAM via diagnostics**, not from
 broadcast frames, so only a subset of the columns is actually broadcast and the rest
-**won't decode from the bus no matter how hard you search**. The tell of a non-broadcast
-channel: its best field **anywhere** only reaches a **moderate r² (≈0.5–0.95)** and lands
+**may not be decodable from the bus at all** — a search on them can legitimately come up
+empty. The tell of a likely-non-broadcast channel: its best field **anywhere** only reaches a **moderate r² (≈0.5–0.95)** and lands
 on a **byte already assigned to a physically-correlated signal** — i.e. it's a *proxy*
 (throttle/MAF tracking the accelerator pedal; a second engine "temp" tracking the one
-broadcast temp), not its own field. Separate it by **absolute value at a distinctive
-operating point** (see *Notes for the assistant*); when no field reads the channel's
-*own* value there, **report "not broadcast"** rather than forcing a fit. Also confirm the
+broadcast temp), not its own field. Separate it **two ways before concluding**: (1)
+**absolute value at a distinctive operating point** (see *Notes for the assistant*) — no
+field reads the channel's *own* value there; and (2) the **divergence-regime test** (recipe
+below) — restrict the search to the operating window where the channel and its co-variates
+physically pull apart (torque goes negative on overrun while airflow stays low-positive) and
+see whether any field tracks the *target* rather than a co-variate. When **both** come up
+empty, report it as "no broadcast field found in what I tested" and note what's still
+untried, rather than a flat "not broadcast" (see *Reporting discipline*). Also confirm the
 two spans roughly match (same drive) and Δ gives r ≈ 0.99 before trusting it, and skip a
 channel that barely moves in the drive (e.g. barometric pressure — no excitation). Bus
 content can differ between captures (an ID present in one drive may be absent in
 another), so re-survey each capture rather than assuming a fixed ID set.
+
+**Divergence-regime recipe — "is it the target, or a co-variate it rides on?"** The
+moderate-r² proxy trap (above) is beatable *before* you conclude "not broadcast", provided
+the scan log also carries the **co-variates** as their own columns (RPM, MAP/load, pedal).
+Isolate the regime where the target and those co-variates **diverge**, and look only there:
+1. **Build sidecars at the shared Δ** for the target *and* each co-variate you want to hold
+   still — `scanlog_reference.py --offset <Δ>` per channel (e.g. torque as the target; RPM,
+   MAP/load, pedal as co-variates).
+2. **Define a physical mask from the co-variate channels** that pins the regime where the
+   target parts company with them. Canonical: engine **overrun** = `pedal < 2 and rpm > 1800`
+   (foot off but engine driven) — torque goes *negative* while airflow/MAP sit low-positive.
+3. **Filter the raw trace and the target sidecar to the mask** with `filter_regime.py`: it
+   interpolates the co-variate sidecars, evaluates a boolean `--where`, and writes the
+   filtered trace + sidecar plus a "% retained / inside-vs-outside ranges" report (a rare
+   regime is flagged as noisy, not rejected):
+   `python scripts/filter_regime.py --trace temp-output/trace_<app>.csv \
+       --sidecar temp-output/sidecar_<target>.csv --ref rpm=temp-output/sidecar_rpm.csv \
+       --ref pedal=temp-output/sidecar_pedal.csv --where "rpm > 1800 and pedal < 2"`
+4. **Re-run `correlate` on the filtered files** — and let it do the comparison for you with
+   **`--covariate`**: `correlate --covariate rpm=<rpm.csv> --covariate map=<map.csv>` adds a
+   **`margin`** column (target Spearman − best co-variate Spearman) and prints a graded lean
+   per winner. Strongly positive ⇒ the field follows the **target**; negative ⇒ it follows a
+   **co-variate** (a proxy); near zero ⇒ still inseparable (tighten the regime). Inside the
+   mask the co-variates are nearly constant, so the margin sharpens.
+5. **Read the lean.** The 2006 Mustang torque check: the
+   `0x200` field that looked like torque globally scored **+0.80 vs MAP** and **−0.05 vs the
+   torque request** inside overrun — clear co-variation, so report it as a strong proxy lean
+   for what was tested rather than a flat "not broadcast". (Note the mask often leaves the
+   target in a *narrow* range — judge by which signal the field follows, not by the absolute
+   fit quality inside the mask.)
 
 ## Vision workflow — digitize a reference from a video of a display
 
@@ -989,6 +1038,32 @@ is unchanged.
   **own absolute value at a distinctive operating point** — the true field must read
   *that* value there (the warm-end temperature, 0 at rest, atmospheric at WOT), not a
   neighbour's. This, not a cleverer excitation, is what separates a collinear cluster.
+- **Collinear cluster, second tool: split by the regime where the signals DIVERGE.**
+  Absolute value (above) needs you to name the true value at an operating point; the
+  offline / parallel decoded-log case hands you a sharper one — a continuous reference for
+  the *co-variates* too (RPM, MAP, load, pedal, all in the same scan log). Find the regime
+  where the target and its co-variates physically pull apart and correlate **only there**.
+  Engine **overrun** (foot off, RPM > ~1800) is the canonical split: torque goes *negative*
+  while airflow/MAP stay low-positive, so a genuine torque field must follow torque down and
+  a load proxy cannot. Worked example: HP Tuners torque *seemed* to land on `0x200` (global
+  R² ≈ 0.7–0.9, Spearman 0.94), but **within overrun** that field tracked MAP at **+0.80**
+  and the torque request at **−0.05** — proving co-variation where no global score could.
+  Pick a log/segment that actually *exercises* the divergence (decel/overrun here); a
+  cruise-only log cannot separate the cluster. The step-by-step recipe (build co-variate
+  sidecars → mask → filter the trace + target sidecar → re-`correlate` → compare within the
+  mask) is in the **parallel decoded-log workflow** above.
+- **High Spearman + low R² is a strong PROXY tell — but only after the fixable causes are
+  ruled out.** The same pattern (rank-tracks at Spearman ≈ 0.9+, fits loosely at R² ≈ 0.7)
+  also comes from an unsolved **lag**, wrong **endianness / signedness**, **saturation /
+  sentinel** clipping, or a **reference-semantics mismatch** (a %-of-reference vs an absolute
+  value, or a unit / scale offset) — all fixable, and all meaning the geometry or setup is
+  wrong, *not* that the field is a proxy. Check those first. Once they're excluded and it
+  persists, high-Spearman/low-R² means the field is tied to the target through a curved,
+  monotone relationship — a *different* physical quantity that rises with it, not its own
+  field. Corroborating tells: the linear fit implies a span much wider than the target's real
+  range (`0x200`'s field swung ~2× torque's), and the top field flips between the target's
+  siblings run-to-run. Resolve it with the divergence-regime recipe (in the parallel
+  decoded-log workflow), not a tighter global fit.
 - **Cross-capture validation is the strongest confirmation.** A field that re-decodes a
   *separate* capture of the same vehicle (a different drive) at Spearman ≈ 0.99 is real,
   not overfit. When you have two recordings, identify/calibrate on one and **verify the
